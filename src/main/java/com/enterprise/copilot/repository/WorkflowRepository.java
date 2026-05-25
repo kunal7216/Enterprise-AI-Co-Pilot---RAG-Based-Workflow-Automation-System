@@ -84,4 +84,16 @@ public interface WorkflowRepository extends JpaRepository<Workflow, Long> {
         """, nativeQuery = true)
     void updateEmbedding(@Param("id") Long id, @Param("embedding") String embedding);
     boolean existsByDocumentName(String documentName);
+
+    @Query(value = """
+            SELECT * FROM workflows
+            WHERE embedding IS NOT NULL
+            AND 1 - (embedding <=> CAST(:vector AS vector)) >= :threshold
+            ORDER BY embedding <=> CAST(:vector AS vector)
+            LIMIT :limit
+            """, nativeQuery = true)
+    List<Workflow> findSimilarWithThreshold(
+            @Param("vector") String vector,
+            @Param("limit") int limit,
+            @Param("threshold") double threshold);
 }
