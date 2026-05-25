@@ -7,6 +7,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.stereotype.Service;
 
+
 import java.util.List;
 import java.util.stream.Collectors;
 
@@ -30,6 +31,7 @@ public class RagService {
 
     private final WorkflowRepository workflowRepository;
     private final OllamaService ollamaService;
+    private final RagConfigService ragConfigService;
 
     // ─────────────────────────────────────────────────────────────
     // PUBLIC API
@@ -185,7 +187,8 @@ public class RagService {
      */
     private List<Workflow> getSimilarInvoicesSafe(String documentText) {
         try {
-            List<Workflow> result = ollamaService.getSimilarWorkflows(documentText, 5);
+            List<Workflow> result = ollamaService.getSimilarWorkflowsWithThreshold(
+                    documentText, 5, ragConfigService.getThreshold());
             return result != null ? result : List.of();
         } catch (Exception e) {
             log.warn("Semantic similarity search failed: {}", e.getMessage());
