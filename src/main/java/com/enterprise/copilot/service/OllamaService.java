@@ -10,6 +10,8 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.*;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
+import org.springframework.web.reactive.function.client.WebClient;
+import reactor.core.publisher.Flux;
 
 import java.util.List;
 import java.util.Map;
@@ -25,6 +27,7 @@ import java.util.regex.Pattern;
  * - embeddings generation (nomic-embed-text)
  * - pgvector-based semantic search
  * - explainable AI summaries
+ * - SSE streaming for real-time decision explanation
  * Falls back to rule-based extraction if Ollama is unavailable.
  */
 @Service
@@ -35,6 +38,9 @@ public class OllamaService {
     private final RestTemplate restTemplate;
     private final ObjectMapper objectMapper;
     private final WorkflowRepository workflowRepository;
+
+    // WebClient for SSE streaming — created lazily after ollamaBaseUrl is injected
+    private WebClient webClient;
 
     @Value("${ollama.base-url:http://enterprise-ollama:11434}")
     private String ollamaBaseUrl;
@@ -48,8 +54,22 @@ public class OllamaService {
     private static final Set<String> APPROVED_VENDORS = Set.of(
             "infosys", "wipro", "tcs", "accenture", "cognizant",
             "amazon", "microsoft", "google", "ibm", "oracle",
-            "deloitte", "pwc", "kpmg", "ey", "capgemini"
-    );
+            "deloitte", "pwc", "kpmg", "ey", "capgemini");
+
+    // ─────────────────────────────────────────────────────────────
+    // WEBCLIENT — lazy init to respect @Value injection order
+    // ─────────────────────────────────────────────────────────────
+
+    private WebClient getWebClient() {
+        if (webClient == null) {
+            webClient = WebClient.builder()
+                    .baseUrl(ollamaBaseUrl)
+                    .defaultHeader(HttpHeaders.CONTENT_TYPE,
+                            MediaType.APPLICATION_JSON_VALUE)
+                    .build();
+        }
+        return webClient;
+    }
 
     // ─────────────────────────────────────────────────────────────
     // PUBLIC API
@@ -80,11 +100,13 @@ public class OllamaService {
     }
 
     /**
-     * Ask Ollama for final workflow recommendation using extracted fields + RAG context.
+     * Ask Ollama for final workflow recommendation using extracted fields + RAG
+     * context.
      */
     public String getApprovalRecommendation(ExtractionResult e, String ragContext) {
         String historySection = (ragContext != null && !ragContext.isBlank())
-                ? "\nVendor History:\n" + ragContext + "\n" : "";
+                ? "\nVendor History:\n" + ragContext + "\n"
+                : "";
 
         String prompt = "Enterprise invoice policy review:" +
                 "\nVendor: " + safe(e.vendorName()) +
@@ -96,8 +118,10 @@ public class OllamaService {
 
         try {
             String resp = callOllama(prompt).trim().toUpperCase();
-            if (resp.contains("APPROVE")) return "APPROVE";
-            if (resp.contains("REJECT")) return "REJECT";
+            if (resp.contains("APPROVE"))
+                return "APPROVE";
+            if (resp.contains("REJECT"))
+                return "REJECT";
             return "ESCALATE";
         } catch (Exception ex) {
             log.warn("Ollama recommendation failed: {}", ex.getMessage());
@@ -113,12 +137,13 @@ public class OllamaService {
     }
 
     /**
-     * Explain final decision for UI / audit trail.
+     * Explain final decision for UI / audit trail (synchronous).
      */
     public String explainDecision(ExtractionResult e, String finalDecision,
-                                  String fraudReasons, String ragContext) {
+            String fraudReasons, String ragContext) {
         String historySection = (ragContext != null && !ragContext.isBlank())
-                ? "\nVendor History Context:\n" + ragContext + "\n" : "";
+                ? "\nVendor History Context:\n" + ragContext + "\n"
+                : "";
 
         String prompt = "Explain this invoice decision in 3 short bullet points.\n" +
                 "Vendor: " + safe(e.vendorName()) + "\n" +
@@ -146,6 +171,43 @@ public class OllamaService {
     }
 
     /**
+     * Stream decision explanation token by token via SSE.
+     * Used by StreamController for real-time UI updates.
+     */
+    public Flux<String> streamExplanation(ExtractionResult e, String finalDecision,
+            String fraudReasons, String ragContext) {
+        String historySection = (ragContext != null && !ragContext.isBlank())
+                ? "\nVendor History Context:\n" + ragContext + "\n"
+                : "";
+
+        String prompt = "Explain this invoice decision in 3 short bullet points.\n" +
+                "Vendor: " + safe(e.vendorName()) + "\n" +
+                "Amount: ₹" + String.format("%.2f", e.amount()) + "\n" +
+                "Confidence: " + String.format("%.2f", e.finalConfidence()) + "\n" +
+                "Fraud Signals: " + safe(fraudReasons) + "\n" +
+                "Final Decision: " + safe(finalDecision) +
+                historySection +
+                "\nKeep it concise and professional.";
+
+        Map<String, Object> body = Map.of(
+                "model", model,
+                "prompt", prompt,
+                "stream", true);
+
+        return getWebClient().post()
+                .uri("/api/generate")
+                .bodyValue(body)
+                .retrieve()
+                .bodyToFlux(JsonNode.class)
+                .map(node -> node.path("response").asText(""))
+                .filter(token -> !token.isEmpty())
+                .onErrorResume(ex -> {
+                    log.warn("SSE stream failed: {}", ex.getMessage());
+                    return Flux.just("Explanation unavailable.");
+                });
+    }
+
+    /**
      * Generate embedding vector for semantic search.
      */
     public List<Double> generateEmbedding(String text) {
@@ -154,14 +216,12 @@ public class OllamaService {
 
         Map<String, Object> body = Map.of(
                 "model", embeddingModel,
-                "prompt", truncate(text, 4000)
-        );
+                "prompt", truncate(text, 4000));
 
         ResponseEntity<JsonNode> res = restTemplate.postForEntity(
                 ollamaBaseUrl + "/api/embeddings",
                 new HttpEntity<>(body, headers),
-                JsonNode.class
-        );
+                JsonNode.class);
 
         if (!res.getStatusCode().is2xxSuccessful() || res.getBody() == null) {
             throw new RuntimeException("Embedding API failed: " + res.getStatusCode());
@@ -174,8 +234,7 @@ public class OllamaService {
 
         return objectMapper.convertValue(
                 embNode,
-                objectMapper.getTypeFactory().constructCollectionType(List.class, Double.class)
-        );
+                objectMapper.getTypeFactory().constructCollectionType(List.class, Double.class));
     }
 
     /**
@@ -194,7 +253,6 @@ public class OllamaService {
 
     /**
      * Returns semantically similar workflows for RAG context.
-     * BUG FIX: Wrapped in try-catch, null-safe return.
      */
     public List<Workflow> getSimilarWorkflows(String documentText, int limit) {
         try {
@@ -209,6 +267,25 @@ public class OllamaService {
     }
 
     /**
+     * Returns semantically similar workflows with configurable similarity
+     * threshold.
+     * Used by RagService when threshold has been tuned via API.
+     */
+    public List<Workflow> getSimilarWorkflowsWithThreshold(
+            String documentText, int limit, double threshold) {
+        try {
+            List<Double> embedding = generateEmbedding(documentText);
+            String vector = toPgVector(embedding);
+            List<Workflow> result = workflowRepository
+                    .findSimilarWithThreshold(vector, limit, threshold);
+            return result != null ? result : List.of();
+        } catch (Exception e) {
+            log.warn("getSimilarWorkflowsWithThreshold failed: {}", e.getMessage());
+            return List.of();
+        }
+    }
+
+    /**
      * Get semantic context string from similar workflows (legacy method).
      */
     public String getRagContext(String documentText) {
@@ -217,12 +294,14 @@ public class OllamaService {
             String vector = toPgVector(embedding);
             List<Workflow> similar = workflowRepository.findSimilar(vector);
 
-            if (similar == null || similar.isEmpty()) return "";
+            if (similar == null || similar.isEmpty())
+                return "";
 
             StringBuilder sb = new StringBuilder();
             int index = 1;
             for (Workflow w : similar) {
-                if (w.getExtractedData() == null || w.getExtractedData().isBlank()) continue;
+                if (w.getExtractedData() == null || w.getExtractedData().isBlank())
+                    continue;
                 sb.append("Past invoice ").append(index++).append(":\n")
                         .append(w.getExtractedData()).append("\n");
                 if (w.getAiRecommendation() != null && !w.getAiRecommendation().isBlank())
@@ -245,8 +324,8 @@ public class OllamaService {
 
         String contextSection = (ragContext != null && !ragContext.isBlank())
                 ? "\n=== HISTORICAL CONTEXT FROM DATABASE ===\n" +
-                "(Use this to improve extraction accuracy and inform your recommendation)\n" +
-                ragContext + "\n=== END CONTEXT ===\n"
+                        "(Use this to improve extraction accuracy and inform your recommendation)\n" +
+                        ragContext + "\n=== END CONTEXT ===\n"
                 : "";
 
         return "You are an enterprise invoice data extractor. Extract fields and return ONLY a JSON object.\n" +
@@ -260,7 +339,8 @@ public class OllamaService {
                 "- confidence: 0.0 to 1.0 (how complete is the extraction)\n" +
                 "- recommendation: APPROVE if vendor is known and amount is consistent with history, else ESCALATE\n" +
                 "- vendor_name: lowercase only\n" +
-                "- If historical context shows this vendor's typical amount range, use it to validate the invoice amount\n" +
+                "- If historical context shows this vendor's typical amount range, use it to validate the invoice amount\n"
+                +
                 contextSection +
                 "\nInvoice text:\n---\n" + snippet + "\n---\n\nJSON:";
     }
@@ -313,8 +393,7 @@ public class OllamaService {
 
             return new ExtractionResult(
                     vendor, amount, llmConf, completeness, validation,
-                    approved, rec, json, invoiceNumber, invoiceDate, dueDate, description
-            );
+                    approved, rec, json, invoiceNumber, invoiceDate, dueDate, description);
 
         } catch (Exception e) {
             log.error("Failed to parse Ollama response: {}", e.getMessage());
@@ -324,15 +403,19 @@ public class OllamaService {
 
     private double computeValidation(JsonNode node) {
         int checks = 4, passed = 0;
-        if (node.path("amount").asDouble(0) > 0) passed++;
-        if (node.path("invoice_date").asText("").matches("\\d{4}-\\d{2}-\\d{2}")) passed++;
-        if (!node.path("vendor_name").asText("").isBlank()) passed++;
-        if (!node.path("invoice_number").asText("").isBlank()) passed++;
+        if (node.path("amount").asDouble(0) > 0)
+            passed++;
+        if (node.path("invoice_date").asText("").matches("\\d{4}-\\d{2}-\\d{2}"))
+            passed++;
+        if (!node.path("vendor_name").asText("").isBlank())
+            passed++;
+        if (!node.path("invoice_number").asText("").isBlank())
+            passed++;
         return (double) passed / checks;
     }
 
     // ─────────────────────────────────────────────────────────────
-    // HTTP CALL
+    // HTTP CALL (synchronous — RestTemplate)
     // ─────────────────────────────────────────────────────────────
 
     private String callOllama(String prompt) {
@@ -342,14 +425,12 @@ public class OllamaService {
         Map<String, Object> body = Map.of(
                 "model", model,
                 "prompt", prompt,
-                "stream", false
-        );
+                "stream", false);
 
         ResponseEntity<JsonNode> res = restTemplate.postForEntity(
                 ollamaBaseUrl + "/api/generate",
                 new HttpEntity<>(body, headers),
-                JsonNode.class
-        );
+                JsonNode.class);
 
         if (res.getStatusCode().is2xxSuccessful() && res.getBody() != null) {
             return res.getBody().path("response").asText();
@@ -377,48 +458,46 @@ public class OllamaService {
                 approved, "ESCALATE", json, "FALLBACK", null, null, "Fallback extraction");
     }
 
-    /**
-     * Handles Indian number formatting (e.g. Rs. 3,24,500).
-     * Priority: TOTAL AMOUNT line → explicit amount field → largest number.
-     */
     private double extractAmount(String text) {
-        // First: TOTAL AMOUNT line
         Matcher totalMatcher = Pattern.compile(
-                "(?i)total[^\\d]{0,30}[Rr]s\\.?\\s*([\\d,]+(?:\\.\\d{1,2})?)"
-        ).matcher(safe(text));
+                "(?i)total[^\\d]{0,30}[Rr]s\\.?\\s*([\\d,]+(?:\\.\\d{1,2})?)").matcher(safe(text));
         while (totalMatcher.find()) {
             try {
                 double v = Double.parseDouble(totalMatcher.group(1).replace(",", ""));
-                if (v > 0) return v;
-            } catch (NumberFormatException ignored) {}
+                if (v > 0)
+                    return v;
+            } catch (NumberFormatException ignored) {
+            }
         }
 
-        // Second: explicit amount field
         Matcher fieldMatcher = Pattern.compile(
-                "(?i)\\bamount\\s*[:\\-]\\s*([\\d,]+(?:\\.\\d{1,2})?)"
-        ).matcher(safe(text));
+                "(?i)\\bamount\\s*[:\\-]\\s*([\\d,]+(?:\\.\\d{1,2})?)").matcher(safe(text));
         while (fieldMatcher.find()) {
             try {
                 double v = Double.parseDouble(fieldMatcher.group(1).replace(",", ""));
-                if (v > 0) return v;
-            } catch (NumberFormatException ignored) {}
+                if (v > 0)
+                    return v;
+            } catch (NumberFormatException ignored) {
+            }
         }
 
-        // Fallback: largest number in document
         Matcher m = Pattern.compile("([\\d,]{4,}(?:\\.\\d{1,2})?)").matcher(safe(text));
         double max = 0;
         while (m.find()) {
             try {
                 double v = Double.parseDouble(m.group(1).replace(",", ""));
-                if (v > max) max = v;
-            } catch (NumberFormatException ignored) {}
+                if (v > max)
+                    max = v;
+            } catch (NumberFormatException ignored) {
+            }
         }
         return max;
     }
 
     private String extractVendor(String lower) {
         for (String v : APPROVED_VENDORS) {
-            if (lower.contains(v)) return v;
+            if (lower.contains(v))
+                return v;
         }
         return "Unknown Vendor";
     }
@@ -434,13 +513,19 @@ public class OllamaService {
 
     private String nullableText(JsonNode node, String field) {
         JsonNode n = node.path(field);
-        if (n.isMissingNode() || n.isNull()) return null;
+        if (n.isMissingNode() || n.isNull())
+            return null;
         String value = n.asText();
         return value == null || value.isBlank() ? null : value;
     }
 
-    private double clamp(double v) { return Math.max(0.0, Math.min(1.0, v)); }
-    private String safe(String v) { return v == null ? "" : v; }
+    private double clamp(double v) {
+        return Math.max(0.0, Math.min(1.0, v));
+    }
+
+    private String safe(String v) {
+        return v == null ? "" : v;
+    }
 
     private String truncate(String text, int maxLen) {
         String safeText = safe(text);
@@ -451,7 +536,8 @@ public class OllamaService {
         StringBuilder sb = new StringBuilder("[");
         for (int i = 0; i < embedding.size(); i++) {
             sb.append(embedding.get(i));
-            if (i < embedding.size() - 1) sb.append(",");
+            if (i < embedding.size() - 1)
+                sb.append(",");
         }
         sb.append("]");
         return sb.toString();
@@ -473,11 +559,7 @@ public class OllamaService {
             String invoiceNumber,
             String invoiceDate,
             String dueDate,
-            String description
-    ) {
-        /**
-         * Weighted confidence: LLM quality (50%) + field completeness (30%) + validation (20%).
-         */
+            String description) {
         public double finalConfidence() {
             return (0.5 * llmConfidence) + (0.3 * completenessScore) + (0.2 * validationScore);
         }
