@@ -10,6 +10,7 @@ import com.enterprise.copilot.enums.WorkflowStatus;
 import com.enterprise.copilot.enums.WorkflowType;
 import com.enterprise.copilot.exception.InvalidStateException;
 import com.enterprise.copilot.exception.ResourceNotFoundException;
+import com.enterprise.copilot.kafka.WorkflowKafkaProducer;
 import com.enterprise.copilot.repository.UserRepository;
 import com.enterprise.copilot.repository.WorkflowHistoryRepository;
 import com.enterprise.copilot.repository.WorkflowRepository;
@@ -44,12 +45,14 @@ public class WorkflowService {
     private final OllamaService ollamaService;
     private final FraudDetectionService fraudDetectionService;
     private final RagService ragService;
+    private final WorkflowKafkaProducer kafkaProducer;
 
-    private static final double CONFIDENCE_THRESHOLD    = 0.70;
+    private static final double CONFIDENCE_THRESHOLD = 0.70;
     private static final double AUTO_APPROVE_CONFIDENCE = 0.85;
-    private static final double AMOUNT_ESCALATE_LIMIT   = 50_000.0;
-    private static final double AMOUNT_AUTO_APPROVE     = 10_000.0;
-    private static final double ANOMALY_DEVIATION       = 0.50;
+    private static final double AMOUNT_ESCALATE_LIMIT = 50_000.0;
+    private static final double AMOUNT_AUTO_APPROVE = 10_000.0;
+    private static final double ANOMALY_DEVIATION = 0.50;
+    private static final double DLQ_CONFIDENCE_THRESHOLD = 0.4;
 
     // =========================================================================
     // PUBLIC CONTROLLER-FACING METHODS
@@ -117,24 +120,23 @@ public class WorkflowService {
                         : workflowRepository.countByCreatedByAndStatus(user, WorkflowStatus.ESCALATED)),
                 new ChartPointDto("REJECTED", isAdmin
                         ? workflowRepository.countByStatus(WorkflowStatus.REJECTED)
-                        : workflowRepository.countByCreatedByAndStatus(user, WorkflowStatus.REJECTED))
-        );
+                        : workflowRepository.countByCreatedByAndStatus(user, WorkflowStatus.REJECTED)));
 
         List<ChartPointDto> decisionChart = isAdmin
                 ? List.of(
-                new ChartPointDto("AUTO_APPROVED",
-                        workflowRepository.countByDecisionType(DecisionType.AUTO_APPROVED)),
-                new ChartPointDto("ESCALATED_TO_MANAGER",
-                        workflowRepository.countByDecisionType(DecisionType.ESCALATED_TO_MANAGER)),
-                new ChartPointDto("MANAGER_APPROVED",
-                        workflowRepository.countByDecisionType(DecisionType.MANAGER_APPROVED)),
-                new ChartPointDto("MANAGER_REJECTED",
-                        workflowRepository.countByDecisionType(DecisionType.MANAGER_REJECTED)))
+                        new ChartPointDto("AUTO_APPROVED",
+                                workflowRepository.countByDecisionType(DecisionType.AUTO_APPROVED)),
+                        new ChartPointDto("ESCALATED_TO_MANAGER",
+                                workflowRepository.countByDecisionType(DecisionType.ESCALATED_TO_MANAGER)),
+                        new ChartPointDto("MANAGER_APPROVED",
+                                workflowRepository.countByDecisionType(DecisionType.MANAGER_APPROVED)),
+                        new ChartPointDto("MANAGER_REJECTED",
+                                workflowRepository.countByDecisionType(DecisionType.MANAGER_REJECTED)))
                 : List.of(
-                new ChartPointDto("AUTO_APPROVED", 0L),
-                new ChartPointDto("ESCALATED_TO_MANAGER", 0L),
-                new ChartPointDto("MANAGER_APPROVED", 0L),
-                new ChartPointDto("MANAGER_REJECTED", 0L));
+                        new ChartPointDto("AUTO_APPROVED", 0L),
+                        new ChartPointDto("ESCALATED_TO_MANAGER", 0L),
+                        new ChartPointDto("MANAGER_APPROVED", 0L),
+                        new ChartPointDto("MANAGER_REJECTED", 0L));
 
         return DashboardInsightsResponse.builder()
                 .stats(stats)
@@ -191,8 +193,20 @@ public class WorkflowService {
         return toResponse(wf);
     }
 
+    /**
+     * Returns all workflows that ended up in the DLQ (status = FAILED after
+     * exhausting retries).
+     */
+    public List<WorkflowResponse> getDlqWorkflows() {
+        return workflowRepository.findByStatus(WorkflowStatus.FAILED,
+                org.springframework.data.domain.Pageable.unpaged())
+                .stream()
+                .map(this::toResponse)
+                .collect(Collectors.toList());
+    }
+
     // =========================================================================
-    // INTERNAL PROCESSING — RAG-enhanced pipeline
+    // INTERNAL PROCESSING — RAG-enhanced pipeline with Kafka DLQ
     // =========================================================================
 
     public WorkflowResponse processDocument(MultipartFile file, String username) {
@@ -231,13 +245,11 @@ public class WorkflowService {
             // 6. RAG confidence adjustments based on vendor history
             if (ragContext.hasContext()) {
                 if (ragContext.approvalRate() >= 80.0) {
-                    // Trusted vendor: boost confidence
                     confidence = Math.min(1.0, confidence + 0.05);
                     log.info("RAG confidence boost (+0.05) for vendor '{}': {}% approval rate",
                             extracted.vendorName(), String.format("%.0f", ragContext.approvalRate()));
                 }
                 if ("HIGH".equalsIgnoreCase(ragContext.vendorRisk())) {
-                    // High-risk vendor: penalize confidence
                     confidence = Math.max(0.0, confidence - 0.10);
                     log.info("RAG confidence penalty (-0.10) for high-risk vendor '{}'",
                             extracted.vendorName());
@@ -245,20 +257,35 @@ public class WorkflowService {
             }
 
             // 7. Fraud detection
-            FraudDetectionService.FraudResult fraudResult =
-                    fraudDetectionService.analyze(extracted, wf.getDocumentName(), LocalDateTime.now());
+            FraudDetectionService.FraudResult fraudResult = fraudDetectionService.analyze(extracted,
+                    wf.getDocumentName(), LocalDateTime.now());
 
-            // 8. Agent decision with RAG context
+            // 8. Route to Kafka DLQ if confidence is critically low
+            if (confidence < DLQ_CONFIDENCE_THRESHOLD) {
+                log.warn("Workflow #{} confidence {:.2f} below DLQ threshold {} — publishing to Kafka",
+                        wf.getId(), confidence, DLQ_CONFIDENCE_THRESHOLD);
+                wf.setConfidenceScore(confidence);
+                wf.setStatus(WorkflowStatus.ESCALATED);
+                wf.setDecisionType(DecisionType.ESCALATED_TO_MANAGER);
+                wf.setDecisionReason(String.format(
+                        "Confidence %.2f below minimum threshold — queued for retry", confidence));
+                wf.setProcessingTimeMs(System.currentTimeMillis() - startMs);
+                workflowRepository.save(wf);
+                kafkaProducer.publishFailed(wf.getId());
+                return toResponse(wf);
+            }
+
+            // 9. Agent decision with RAG context
             AgentDecision decision = runAgent(extracted, confidence, fraudResult, ragContext);
 
             long elapsed = System.currentTimeMillis() - startMs;
 
-            // 9. AI Explanation with RAG context
+            // 10. AI Explanation with RAG context
             String aiExplanation = ollamaService.explainDecision(
                     extracted, decision.decisionType().name(),
                     fraudResult.reasons(), ragContext.contextText());
 
-            // 10. Save final workflow state
+            // 11. Save final workflow state
             wf.setExtractedData(extracted.jsonData());
             wf.setConfidenceScore(confidence);
             wf.setAiRecommendation(aiExplanation);
@@ -269,13 +296,13 @@ public class WorkflowService {
             wf.setReviewComments(buildReviewNotes(decision.reason(), fraudResult));
             workflowRepository.save(wf);
 
-            // 11. Store embedding for future RAG lookups
+            // 12. Store embedding for future RAG lookups
             ollamaService.updateWorkflowEmbedding(wf.getId(), text);
 
             addHistory(wf, WorkflowStatus.PROCESSING, decision.status(), user, decision.reason());
 
             log.info("Workflow #{} processed in {}ms | confidence={} | rag={} past invoices | " +
-                            "fraud={}/{} | decision={}",
+                    "fraud={}/{} | decision={}",
                     wf.getId(), elapsed,
                     String.format("%.2f", confidence),
                     ragContext.invoiceCount(),
@@ -298,6 +325,10 @@ public class WorkflowService {
             wf.setReviewComments("AI unavailable — escalated for manual review");
             workflowRepository.save(wf);
 
+            // Publish to Kafka for retry on AI failure
+            kafkaProducer.publishFailed(wf.getId());
+            log.info("Workflow #{} published to Kafka for retry after AI failure", wf.getId());
+
             addHistory(wf, WorkflowStatus.PROCESSING, WorkflowStatus.ESCALATED,
                     user, "AI unavailable — escalated for manual review");
 
@@ -315,7 +346,6 @@ public class WorkflowService {
             FraudDetectionService.FraudResult fraudResult,
             RagService.RagContext ragContext) {
 
-        // RAG-aware threshold: lower for trusted vendors with strong history
         double effectiveThreshold = CONFIDENCE_THRESHOLD;
         if (ragContext.isTrustedVendor()) {
             effectiveThreshold = 0.65;
@@ -338,7 +368,8 @@ public class WorkflowService {
 
         if (extracted.amount() > AMOUNT_ESCALATE_LIMIT) {
             String ragNote = ragContext.hasContext() && ragContext.avgAmount() > 0
-                    ? String.format(" (historical avg: ₹%.2f)", ragContext.avgAmount()) : "";
+                    ? String.format(" (historical avg: ₹%.2f)", ragContext.avgAmount())
+                    : "";
             return new AgentDecision(WorkflowStatus.ESCALATED,
                     DecisionType.ESCALATED_TO_MANAGER,
                     String.format("Amount ₹%.2f exceeds ₹%.2f manager approval threshold%s",
@@ -351,7 +382,6 @@ public class WorkflowService {
                     "Vendor '" + extracted.vendorName() + "' is not in the approved vendor list");
         }
 
-        // RAG anomaly detection: compare against historical average
         if (ragContext.hasContext() && ragContext.avgAmount() > 0) {
             double deviation = Math.abs(extracted.amount() - ragContext.avgAmount())
                     / ragContext.avgAmount();
@@ -362,7 +392,6 @@ public class WorkflowService {
                                 extracted.amount(), deviation * 100, ragContext.avgAmount()));
             }
         } else {
-            // Fallback DB-based anomaly detection (when no RAG context or avg is 0)
             List<Workflow> pastWfs = workflowRepository
                     .findByVendorInExtractedData(extracted.vendorName());
             if (pastWfs.size() >= 3) {
@@ -393,7 +422,8 @@ public class WorkflowService {
 
             String ragNote = ragContext.hasContext()
                     ? String.format(", RAG: %d past invoices (%.0f%% approved)",
-                    ragContext.invoiceCount(), ragContext.approvalRate()) : "";
+                            ragContext.invoiceCount(), ragContext.approvalRate())
+                    : "";
             return new AgentDecision(WorkflowStatus.COMPLETED,
                     DecisionType.AUTO_APPROVED,
                     String.format("Auto-approved: ₹%.2f < ₹%.2f, confidence %.2f > %.2f, fraud LOW, AI=APPROVE%s",
@@ -420,9 +450,9 @@ public class WorkflowService {
         }
 
         WorkflowStatus prev = wf.getStatus();
-        boolean approve  = "APPROVE".equalsIgnoreCase(req.getAction());
+        boolean approve = "APPROVE".equalsIgnoreCase(req.getAction());
         WorkflowStatus next = approve ? WorkflowStatus.COMPLETED : WorkflowStatus.REJECTED;
-        DecisionType   dt   = approve ? DecisionType.MANAGER_APPROVED : DecisionType.MANAGER_REJECTED;
+        DecisionType dt = approve ? DecisionType.MANAGER_APPROVED : DecisionType.MANAGER_REJECTED;
 
         wf.setStatus(next);
         wf.setDecisionType(dt);
@@ -493,7 +523,8 @@ public class WorkflowService {
                         .fromStatus(h.getFromStatus() != null ? h.getFromStatus().name() : null)
                         .toStatus(h.getToStatus().name())
                         .changedByUsername(h.getChangedBy() != null
-                                ? h.getChangedBy().getUsername() : "system")
+                                ? h.getChangedBy().getUsername()
+                                : "system")
                         .notes(h.getNotes())
                         .changedAt(h.getChangedAt() != null ? h.getChangedAt().toString() : null)
                         .build())
@@ -504,17 +535,15 @@ public class WorkflowService {
         User user = getUser(username);
         boolean isAdmin = isManagerOrAdmin(user);
 
-        long total     = isAdmin ? workflowRepository.count() : workflowRepository.countByCreatedBy(user);
-        long pending   = countStat(user, WorkflowStatus.PENDING, isAdmin);
+        long total = isAdmin ? workflowRepository.count() : workflowRepository.countByCreatedBy(user);
+        long pending = countStat(user, WorkflowStatus.PENDING, isAdmin);
         long completed = countStat(user, WorkflowStatus.COMPLETED, isAdmin);
-        long rejected  = countStat(user, WorkflowStatus.REJECTED, isAdmin);
+        long rejected = countStat(user, WorkflowStatus.REJECTED, isAdmin);
         long escalated = countStat(user, WorkflowStatus.ESCALATED, isAdmin);
 
         double avgConf = workflowRepository.findAverageConfidenceScore().orElse(0.0);
         double avgTime = workflowRepository.findAverageProcessingTimeMs().orElse(0.0) / 1000.0;
 
-        // BUG FIX: automationRate should count only AUTO_APPROVED, not all completed.
-        // Counting all COMPLETED inflates the rate because it includes MANAGER_APPROVED too.
         long autoApproved = workflowRepository.countByDecisionType(DecisionType.AUTO_APPROVED);
         double autoRate = total > 0 ? (double) autoApproved / total * 100 : 0.0;
 
@@ -562,10 +591,10 @@ public class WorkflowService {
 
     private String extractText(MultipartFile file) throws IOException {
         return switch (detectType(file)) {
-            case "PDF"  -> extractPdf(file);
+            case "PDF" -> extractPdf(file);
             case "DOCX" -> extractDocx(file);
             case "XLSX" -> extractXlsx(file);
-            case "TXT"  -> new String(file.getBytes());
+            case "TXT" -> new String(file.getBytes());
             default -> throw new UnsupportedOperationException(
                     "Unsupported file type. Upload PDF, DOCX, XLSX, or TXT.");
         };
@@ -588,24 +617,24 @@ public class WorkflowService {
     private String extractXlsx(MultipartFile file) throws IOException {
         try (XSSFWorkbook wb = new XSSFWorkbook(file.getInputStream())) {
             StringBuilder sb = new StringBuilder();
-            wb.forEach(sheet -> sheet.forEach(row ->
-                    row.forEach(cell -> sb.append(cell.toString()).append("\t"))));
+            wb.forEach(sheet -> sheet.forEach(row -> row.forEach(cell -> sb.append(cell.toString()).append("\t"))));
             return sb.toString();
         }
     }
 
     private String detectType(MultipartFile file) {
         String name = Objects.requireNonNull(file.getOriginalFilename(), "No filename").toLowerCase();
-        if (name.endsWith(".pdf"))  return "PDF";
-        if (name.endsWith(".docx")) return "DOCX";
-        if (name.endsWith(".xlsx")) return "XLSX";
-        if (name.endsWith(".txt"))  return "TXT";
+        if (name.endsWith(".pdf"))
+            return "PDF";
+        if (name.endsWith(".docx"))
+            return "DOCX";
+        if (name.endsWith(".xlsx"))
+            return "XLSX";
+        if (name.endsWith(".txt"))
+            return "TXT";
         return "UNKNOWN";
     }
 
-    /**
-     * Quick vendor extraction before full AI extraction — used for RAG lookup.
-     */
     private String extractVendorQuick(String text) {
         String lower = text.toLowerCase();
         String[] knownVendors = {
@@ -614,30 +643,35 @@ public class WorkflowService {
                 "deloitte", "pwc", "kpmg", "ey", "capgemini"
         };
         for (String v : knownVendors) {
-            if (lower.contains(v)) return v;
+            if (lower.contains(v))
+                return v;
         }
         return "";
     }
 
     private double parseAmountFromJson(String jsonData) {
-        if (jsonData == null) return 0.0;
+        if (jsonData == null)
+            return 0.0;
         try {
             if (jsonData.contains("\"amount\":")) {
                 String sub = jsonData.split("\"amount\":")[1].split("[,}]")[0].trim();
                 return Double.parseDouble(sub);
             }
-        } catch (Exception ignored) {}
+        } catch (Exception ignored) {
+        }
         return 0.0;
     }
 
     private String extractVendorFromJson(String jsonData) {
-        if (jsonData == null) return "";
+        if (jsonData == null)
+            return "";
         try {
             String key = "\"vendor_name\":";
             if (jsonData.contains(key)) {
                 return jsonData.split(key)[1].split("[,}]")[0].trim().replace("\"", "");
             }
-        } catch (Exception ignored) {}
+        } catch (Exception ignored) {
+        }
         return "";
     }
 
@@ -660,7 +694,7 @@ public class WorkflowService {
     }
 
     private void addHistory(Workflow wf, WorkflowStatus from,
-                            WorkflowStatus to, User by, String notes) {
+            WorkflowStatus to, User by, String notes) {
         historyRepository.save(WorkflowHistory.builder()
                 .workflow(wf)
                 .fromStatus(from)
@@ -694,13 +728,14 @@ public class WorkflowService {
     }
 
     private String safeJson(String value) {
-        if (value == null) return "";
+        if (value == null)
+            return "";
         return value.replace("\"", "'").replace("\n", " ");
     }
 
     private record AgentDecision(
             WorkflowStatus status,
             DecisionType decisionType,
-            String reason
-    ) {}
+            String reason) {
+    }
 }

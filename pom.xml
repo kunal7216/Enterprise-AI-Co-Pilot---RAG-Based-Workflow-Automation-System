@@ -39,12 +39,6 @@
             <artifactId>spring-boot-starter-web</artifactId>
         </dependency>
 
-        <!--
-            WebFlux added for SSE streaming only.
-            We exclude spring-webflux auto-configuration to avoid
-            conflicts with the existing Spring MVC setup.
-            WebClient and Flux/Mono are still fully available.
-        -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-webflux</artifactId>
@@ -54,6 +48,12 @@
                     <artifactId>spring-boot-starter-reactor-netty</artifactId>
                 </exclusion>
             </exclusions>
+        </dependency>
+
+        <!-- ─── KAFKA ────────────────────────────────────────── -->
+        <dependency>
+            <groupId>org.springframework.kafka</groupId>
+            <artifactId>spring-kafka</artifactId>
         </dependency>
 
         <!-- ─── DATA ─────────────────────────────────────────── -->
