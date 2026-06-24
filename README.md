@@ -453,7 +453,6 @@ Fraud rules provide deterministic and explainable checks, while RAG adds histori
 JWT provides stateless authentication for REST APIs and supports role-based workflow access.
 
 ### Why Docker Compose?
-
 Docker Compose allows the backend, database, and local LLM service to run together in a repeatable local environment.
 
 ---
